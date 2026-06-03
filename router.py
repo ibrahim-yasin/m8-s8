@@ -9,27 +9,88 @@ types and dispatches it to a different retrieval pipeline:
 
 from __future__ import annotations
 
+import re
 import weaviate
 
 from retrieval_helpers import bm25_search, dense_search, hybrid_search
 
 
 def classify_query(query: str) -> str:
-    """Return one of "factoid", "semantic", "mixed".
+    """Return one of 'factoid', 'semantic', 'mixed'."""
+    q = query.strip()
+    words = q.split()
 
-    Two valid implementations are accepted (pick one and explain in
-    routing_report.md):
+    has_digits = bool(re.search(r"\d", q))
+    has_quotes = bool(re.search(r'"[^"]+"', q))
 
-      Rule-based: heuristics over query length, presence of named entities
-      (regex for capitalized multi-word phrases), presence of digits,
-      exact-phrase quotes.
+    has_code_like = bool(
+        re.search(
+            r"(\b[A-Za-z_]*[A-Z][A-Za-z_]*[A-Z][A-Za-z0-9_]*\b|"
+            r"\b[A-Za-z_]+\.[A-Za-z0-9_.]+\b|"
+            r"\b0x[0-9a-fA-F]+\b|"
+            r"\b[A-Z_]{3,}\b|"
+            r"\b\w+\(\)|"
+            r"\b\d+\.\d+(?:\.\d+)*\b|"
+            r"[-_/])",
+            q,
+        )
+    )
 
-      Embedding-similarity-based: maintain three labeled exemplar query sets
-      (10 each); embed the incoming query; classify to the nearest exemplar
-      centroid in embedding space.
-    """
-    # TODO: implement either rule-based or embedding-based classifier
-    raise NotImplementedError("classify_query is not yet implemented")
+    factoid_keywords = [
+        "what is",
+        "what does",
+        "how does",
+        "where can i find",
+        "why does",
+        "what causes",
+    ]
+
+    paraphrastic_keywords = [
+        "tips",
+        "should",
+        "can i",
+        "can a",
+        "how can i",
+        "how to",
+        "best",
+        "improve",
+        "drawback",
+        "efficiently",
+        "required",
+        "really",
+    ]
+
+    factoid_signals = 0
+    semantic_signals = 0
+
+    if has_digits:
+        factoid_signals += 2
+    if has_quotes:
+        factoid_signals += 2
+    if has_code_like:
+        factoid_signals += 3
+
+    q_lower = q.lower()
+
+    if any(k in q_lower for k in factoid_keywords):
+        factoid_signals += 1
+
+    if any(k in q_lower for k in paraphrastic_keywords):
+        semantic_signals += 2
+
+    if len(words) <= 5:
+        semantic_signals += 1
+
+    if len(words) > 12 and not has_code_like:
+        semantic_signals += 1
+
+    if factoid_signals >= semantic_signals + 2:
+        return "factoid"
+
+    if semantic_signals >= factoid_signals:
+        return "semantic"
+
+    return "mixed"
 
 
 def routed_search(client: weaviate.Client, query: str, k: int, embedder) -> list[str]:
@@ -42,4 +103,10 @@ def routed_search(client: weaviate.Client, query: str, k: int, embedder) -> list
     #         "factoid"  -> bm25_search(client, query, k)
     #         "semantic" -> dense_search(client, query, k, embedder)
     #         else       -> hybrid_search(client, query, k, embedder, alpha=0.5)
-    raise NotImplementedError("routed_search is not yet implemented")
+    kind = classify_query(query)
+    if kind == "factoid":
+        return bm25_search(client, query, k)
+    elif kind == "semantic":
+        return dense_search(client, query, k, embedder)
+    else:
+        return hybrid_search(client, query, k, embedder, alpha=0.5)
